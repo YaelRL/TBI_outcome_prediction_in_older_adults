@@ -1,0 +1,875 @@
+---
+title: "Outcome prediction after CT-positive TBI in older adults"
+output:
+  rmdformats::readthedown
+date: "2023-06-19"
+---
+
+
+```{r setup, include=FALSE, results='asis', message=FALSE, warning=FALSE}
+
+library(rmdformats)
+library(knitr)
+knitr::opts_chunk$set(echo = FALSE, message=FALSE, warning=FALSE, results='asis')
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(pander)
+library(corrplot)
+library(sjPlot)
+library(caret)
+library(pROC)
+library(gridExtra)
+library(kableExtra)
+library(table1)
+library(glmnet)
+library(tidymodels)
+library(probably)
+library(rms)
+library(forestplot)
+
+
+panderOptions("table.split.cells", Inf)
+
+```
+
+```{r}
+# helper functions for table1- tabulating demographics and clinical characteristics
+
+render_cont <- function(x) {
+  #display just Mean (SD) and not median and IQR
+    with(stats.apply.rounding(stats.default(x), digits=2), 
+         c("", "Mean (SD)"=sprintf("%s (&plusmn; %s)", MEAN, SD)))
+} 
+
+render_logical <- function(x, ...) {
+  #for logical variables- display only the "Yes" row
+  #for categorical variables- display Mean (SD)
+    y <- render.default(x, ...)
+    if (is.logical(x)) y[2] else y
+}
+
+pvalue <- function(x, ...) {
+  # Construct vectors of data y, and groups (strata) g
+  y <- unlist(x)
+  g <- factor(rep(1:length(x), times=sapply(x, length)))
+  if (is.numeric(y)) {
+    if (length(y)>60) # we can use parametric tests
+    {
+      #p <- t.test(y ~ g)$p.value
+      p<-summary(aov(y ~ g))[[1]][["Pr(>F)"]][1]}
+    else {#non-parametric test for numeric variables
+      p <- wilcox.test(y ~ g, exact=FALSE)$p.value}
+    
+  } else {
+    # For categorical variables, check if any value is 5 or lower-
+    #in case of a table of 3X3 or more, chisq can be used if expected 
+    #value of cells is 5 or greater in at least 80% of cells.
+    if (any(chisq.test(table(y,g))$observed)<5) {
+      p <- fisher.test(table(y, g))$p.value 
+    }
+    else {p<-chisq.test(table(y, g))$p.value}
+    
+  }
+  # Format the p-value, using an HTML entity for the less-than sign.
+  # The initial empty string places the output on the line below the variable label.
+  #c("", sub("<", "&lt;", format.pval(p, digits=3, eps=0.001)))
+  c(sub("<", "&lt;", format.pval(p, digits=3, eps=0.001)))
+}
+
+
+```
+
+**Background**: Current TBI outcome prediction models were developed and validated on young cohorts. This study's goal is to test their validity in a unique cohort of older adults with CT-positive TBI.   
+**Methods**: TRACK-Geriatrics TBI (TRACK-GERI) is a multi-center prospective observational study of adults 65+ years old who presented to the emergency department 72 hours after a TBI (n=90). Three 6-month mortality prediction models were evaluated on this cohort: Marshall's score, Rotterdam score and IMPACT models. Models' performance was evaluated using confusion matrices and ROC curves. The associations of demographic, injury, clinical and CT predictors to 6-month mortality in our cohort were explored using frequency tables, Wilcoxon rank-sum test and Fisher's exact test.         
+**Results**: Marshall's score had a sensitivity of 57% (AUC = 0.76, 95% CI: 0.63-0.90), Rotterdam Score had a sensitivity of 50% (AUC=0.73, 95% CI: 0.55-0.91), IMPACT Lab model had a sensitivity of 71% and specificity of 87% (AUC=0.78, 95% CI: 0.61-0.94). IMPACT Extended achieved an AUC of 0.74 (CI) and IMPACT core model performed poorly (AUC=0.45) in our cohort. Predictors used in current models were tested for their association to 6-month mortality in our cohort. Basal cisterns effacement and midline shift showed a statistically significant correlation to 6-month mortality (p-value<0.001) but epidural, subarachnoid and intraventricular hematoma (which are used in the Rotterdam score and IMPACT model) did not. Non-hemorrhagic findings such as contusion, edema and shear were correlated to 6-month mortality in our cohort (p-value=0.018, 0.005, 0.021).  Clinical features motor GCS, pupil reactivity, hypoxia and hypotension (used in IMPACT core and extended models) were not significantly correlated to the outcome, same as hemoglobin (used in IMPACT lab model). ED Blood glucose levels were higher in those who expired (Mean 160 mg/dL vs. 130 mg/dL, p-value=0.036).   
+**Conclusions**: Accepted cut-off points showed low sensitivity for 6-month mortality prediction in older adults (57% at best). ROC AUCs of Marshall's score, Rotterdam score and IMPACT lab and extended model were similar to those previously published. IMPACT core model, however, proved to be inadequate. Most predictors used in current outcome prediction models were not significantly associated with the outcome in our cohort. Other predictors such as non-hemorrhagic CT pathologies and emergency department glucose levels may be used to improve outcome prediction in older adults. 
+
+
+# Methods
+**Participants**  
+The study included participants in TRACK-GERI (n=133) and TRACK-GERI pilot (n=30). All participants were 65+ years old and presented to the ED after a TBI. Brain CT and 6-month mortality data was available for 132 participants, and 92 of them (69%) had a CT positive for brain injury. Two participants died due to a non-TBI related cause, and were excluded. The final analysis set consisted of 90 participants.     
+
+**Brain CT data**  
+Since GCS scores may underestimate TBI severity in older adults we chose to include in this study participants who had a CT positive for brain injury (including intracerebral hematoma, shear, epidural hematoma, subdural hematoma, subarachnoid hematoma, intraventricular hematoma, edema, midline shift and downward herniation). CT images from the ED were coded by a neuroradiologist according to CT CDEs. In addition, Clinical notes for CT readings were analyzed for verifying hematoma and midline shift size, surgical evacuation of intracranial hemorrhage and the existence of petechial hemorrhages.   
+Lesions whose size was described only as "small" or "trace" were assigned a numerical values of 5 and 3 mm, respectively.   
+Lesions sizes which were described only by maximal thickness were considered as less than 25cc if their maximal thickness was under 2.8 cm (cubic root of 25). 
+
+**Additional data**  
+Demographic and clinical predictors used by outcome prediction models were available for all 90 participants.   
+
+
+```{r}
+#reading and preparing the data
+raw_path = "C:/Users/User/Documents/TRACK-GERI/raw data/TRACKGERIDataDump_05Mar2023/"
+clean_path= "C:/Users/User/Documents/TRACK-GERI/clean data/TRACKGERI_05Mar2023/"
+
+
+main_wide = read.csv(paste0(clean_path, "RO1 and Pilot/track_geri_RO1_and_Pilot_wide_07-09-2023.csv"), 
+                         header=TRUE, strip.white = TRUE, na.strings = c("", "NA"))
+#filtering out empty rows
+main_wide = main_wide %>% filter(!is.na(id))
+main_wide$DeathCauseTBI[main_wide$ExpiredBy_6mo==0] = 0
+
+```
+
+
+```{r}
+#creating the analysis set according to inclusion/exclusion criteria:
+rotter_df = main_wide %>% filter(!is.na(RotterdamScore)) #CT data available
+rotter_df = rotter_df %>% filter(positive_CT==1) # CT positive for head trauma
+rotter_df = rotter_df %>% filter(!is.na(ExpiredBy_6mo)) #6-month mortality data available
+rotter_df = rotter_df %>% filter(!(DeathCauseTBI==0 & ExpiredBy_6mo==1)) #excluding deaths unrelated to TBI
+# 16 died out of 90, 18%
+
+#assigning 0  where midline shift size is not reported
+rotter_df$midline_shift[is.na(rotter_df$midline_shift)] = 0
+
+
+#------------------------ Rotterdam score items-------------------------
+#creating a variable for Rotterdam score item#1: basal cisterns effacement (0=none, 1=partial, 2=complete)
+rotter_df$rot1_basal_cisterns[rotter_df$basal_cisterns=="None"] = 0
+rotter_df$rot1_basal_cisterns[rotter_df$basal_cisterns=="Partial effacement"] = 1
+rotter_df$rot1_basal_cisterns[rotter_df$basal_cisterns=="Complete effacement"] = 2
+rotter_df$rot1_basal_cisterns[is.na(rotter_df$basal_cisterns)] = 0
+
+
+rotter_df$rot2_midline_shift =  ifelse(rotter_df$midline_shift > 5, 1, 0)
+rotter_df$rot2_midline_shift[is.na(rotter_df$midline_shift)] = 0
+
+rotter_df$rot3_EDH = ifelse(rotter_df$edh == 1, 0, 1)
+rotter_df$rot_EDH[is.na(rotter_df$edh)] = 1
+
+rotter_df$rot4_IVHSAH = ifelse((rotter_df$ivh == 1 | rotter_df$sah ==1), 1, 0)
+rotter_df$rot4_IVHSAH[is.na(rotter_df$ivh) & is.na(rotter_df$sah)] = 0
+
+
+# creating a binary variable for Rotterdam score's cut-offs of 4+ and 3+
+rotter_df$Rotterdam_3plus = ifelse(rotter_df$RotterdamScore >2, 1, 0)
+rotter_df$Rotterdam_4plus = ifelse(rotter_df$RotterdamScore >3, 1, 0)
+rotter_df$Positive_Rotterdam[rotter_df$RotterdamScore >3] = ">3"
+rotter_df$Positive_Rotterdam[rotter_df$RotterdamScore <=3] = "<=3"
+
+# formatting an outcome variable
+rotter_df$outcome = factor(rotter_df$ExpiredBy_6mo, levels=c(1, 0), labels=c("Expired", "Survived"))
+rotter_df$DeathCauseTBI = 
+  ifelse(rotter_df$DeathCause %in% c("Head injury/initial injury", "Head injury/secondary intracranial damage"),1,0)
+
+
+rotter_df$basal_cisterns_yn = ifelse(rotter_df$rot1_basal_cisterns==0, 0, 1)
+
+```
+
+# Cohort description
+```{r}
+df = rotter_df
+
+# formatting variables
+df$frailty[df$GFI_score_Baseline > 4] = "Frail (>4 total score)"
+df$frailty[df$GFI_score_Baseline <= 4] = "Not frail (<4)"
+
+#formatting categorical variables
+df$EmplmtStatus = recode(df$EmplmtStatus, 
+                         "Working Full Time" = "Employed", 
+                         "Working Part Time" = "Employed")
+
+df$EmplmtStatus = factor(df$EmplmtStatus, levels=c("Retired", "Employed", "Disabled"))
+df$MaritalStatus[df$MaritalStatus=="Domestic partnership"] = "Married"
+df$MaritalStatus = factor(df$MaritalStatus, 
+                          levels=c("Married", "Widowed", "Divorced", "Never married"))
+
+df$HealthInsurance[is.na(df$HealthInsurance)] = "Unknown"
+df$HealthInsurance[df$HealthInsurance=="Insured"] = "Private insurance"
+df$HealthInsurance = factor(df$HealthInsurance, 
+                            levels=c("Private insurance", "Medicare/Medicaid", "Unknown"))
+
+df$normal_mci_dementia = factor(df$normal_mci_dementia, levels=c("Normal", "MCI", "Dementia"), 
+                                labels=c("Normal (CDR = 0)", "MCI (CDR < 0.5)", "Dementia (CDR > 0.5)"))
+
+binary_cols = c("RegularActivities", "Smoked100Cigs", "CurrUseTobacco")
+#converting to logical
+df[binary_cols] = apply(df[binary_cols], MARGIN=2, as.logical)
+
+#labeling
+Hmisc::label(df$EduYrCt) = "Years of education"
+Hmisc::label(df$EmplmtStatus) = "Employment status"
+Hmisc::label(df$MaritalStatus) = "Marital status"
+Hmisc::label(df$Subject_LivingSituation) = "Living situation"
+Hmisc::label(df$RegularActivities) = "Engaged in regularly scheduled activities"
+Hmisc::label(df$RegularActivitiesHrsPerWeek) = "Regular activities- hours per week"
+Hmisc::label(df$HealthInsurance) = "Health Insurance"
+Hmisc::label(df$AUDITC_score) = "Alcohol Use Disorder Identification Test \n(range 0-12 (worst))"
+Hmisc::label(df$Smoked100Cigs) = "History of tobacco use"
+Hmisc::label(df$TotalYrsSmoked) = "Total years smoked"
+Hmisc::label(df$CurrUseTobacco) = "Current tobacco use"
+Hmisc::label(df$preinjury_cognitive_status) = "Pre-injury cognitive status"
+Hmisc::label(df$FAQ_score_Baseline) = "FAQ \n(Functional Activities Questionnaire, range 0-30 (worst))"
+Hmisc::label(df$WalkingBlocks_Baseline) = "Average daily number of blocks walked per day"
+Hmisc::label(df$frailty) = "Frailty status (GFI)"
+Hmisc::label(df$GFI_score_Baseline) = "Groningen Frailty Indicator (GFI, range 0-15 (worst))"
+Hmisc::label(df$NPIQ_score_Baseline) = "NPI-Q (Neuropsychiatric Inventory questionnaire, range 0-36 (worst))"
+Hmisc::label(df$eCogMean_score_Baseline) = "ECog12 (Everyday Cognition-12, range 1-4 (worst))"
+df$sex = ifelse(df$Sex=="Female", T, F)
+Hmisc::label(df$sex) = "Sex female"
+
+df$race = ifelse(df$Race=="White", T, F)
+Hmisc::label(df$race) = "Race white"
+
+df$presenting_GCS = factor(df$presenting_GCS, levels=c("15", "14", "13", "<13"))
+df$GCS_severity = factor(df$GCS_severity, levels=c("Mild", "Moderate", "Severe"))
+
+df$injury_mechanism = factor(df$injury_mechanism, levels=c("Ground level fall", "Fall from height", "Motor vehicle accident", "Assault", "Other"))
+
+#eliminating outliers
+df$EDGlucose[df$EDGlucose==13] = 130
+df$EDGlucose[df$EDGlucose==340] = 150 #Q3
+
+df$prior_TBI_PTA_LOC = factor(df$prior_TBI_PTA_LOC, levels=c("PTA only", "LOC +/- PTA", "No prior TBI"))
+df$prior_TBI_freq = factor(df$prior_TBI_freq, levels=c("None", "1", "> 1"))
+df$discharge_disposition = factor(df$discharge_disposition, levels=c("Home", "Rehabilitation", "Nursing facility", "Died"))
+df$external_injury = factor(df$external_injury, levels=c(0,1), labels = c("No", "Yes"))
+
+df$ACRM[df$ACRM==0] ="No"
+df$ACRM[df$ACRM==1] = "Yes"
+
+df$positive_CT[df$positive_CT==0] ="No"
+df$positive_CT[df$positive_CT==1] = "Yes"
+
+df$ACRMneg_CTpos = ifelse((df$ACRM=="No" & df$positive_CT=="Yes"), T, F)
+df$ACRMpos_CTneg = ifelse((df$ACRM=="Yes" & !df$positive_CT=="No"), T, F)
+
+df$LOC = factor(df$LOC, levels=c(0,1), labels=c("No", "Yes"))
+df$PTA = factor(df$PTA, levels=c(0,1), labels=c("No", "Yes"))
+
+df$EDArrHypotension = factor(df$EDArrHypotension, levels=c(0,1), labels=c("No", "Yes"))
+df$EDArrHypoxia = factor(df$EDArrHypoxia, levels=c(0,1), labels=c("No", "Yes"))
+
+df$EDCorrCoagulopathy = factor(df$EDCorrCoagulopathy, levels=c(0,1), labels=c("No", "Yes"))
+
+Hmisc::label(df$presenting_GCS) = "Glasgow Comma Scale (GCS)"
+Hmisc::label(df$GCS_severity) = "GCS severity"
+Hmisc::label(df$GcsEDArrMotor) = "ED GCS motor"
+Hmisc::label(df$ACRM) = "ACRM+"
+Hmisc::label(df$ACRMneg_CTpos) = "ACRM- and CT+"
+Hmisc::label(df$ACRMpos_CTneg) = "ACRM+ and CT-"
+Hmisc::label(df$LOC) = "LOC - Loss of Consciousness"
+Hmisc::label(df$PTA) = "PTA - Post-traumatic Amnesia"
+Hmisc::label(df$prior_TBI_PTA_LOC) = "Prior TBI"
+Hmisc::label(df$prior_TBI_freq) = "Prior TBI frequency"
+Hmisc::label(df$InjToCTTime) = "Time from injury to first CT scan (hours)"
+Hmisc::label(df$EDCorrCoagulopathy) = "Anticoagulant reversal in ED"
+Hmisc::label(df$positive_CT)<-"CT positive for intracranial trauma"
+Hmisc::label(df$normal_mci_dementia) = "Pre-injury cognition"
+Hmisc::label(df$ED_disposition) = "ED disposition"
+Hmisc::label(df$discharge_disposition) = "Discharge disposition"
+Hmisc::label(df$injury_mechanism) = "Injury mechanism"
+Hmisc::label(df$external_injury) = "External injury (AIS>=2)"
+Hmisc::label(df$EDGlucose) = "ED glucose (mg/dL)"
+Hmisc::label(df$EDHemoglobin) = "ED Hemoglobin (mg/dL)"
+Hmisc::label(df$EDArrHypotension)= "ED arrival hypotension"
+Hmisc::label(df$EDArrHypoxia) = "ED arrival hypoxia"
+Hmisc::label(df$EDPupilReactivity) = "ED pupil reactivity"
+Hmisc::label(df$GCS_severity) = "TBI severity by GCS"
+
+table1(~ Age + sex + race + injury_mechanism +presenting_GCS + GCS_severity + InjToCTTime +
+         LOC + PTA + ED_disposition + discharge_disposition+
+         Charlson_comorbidity_index + polypharmacy_n + frailty + preinjury_cognitive_status + AUDITC_score +Anticoagulants + PlateletAggregInhibitors
+        | outcome,
+         data = df,
+        overall="Overall",
+        # overall=FALSE, extra.col=list(`P-value`=pvalue),
+         render=render_logical,
+         render.continuous = render_cont,
+       caption="Table 1. Demographic, injury and clinical characteristics"
+       )#%>% kable(format="markdown")
+
+```
+
+# Marshall's score (Marshall et al., 1991)
+Marshall's categories are:  
+**Diffuse injury I** (no visible pathology) No visible intracranial pathology seen on CT scan  
+**Diffuse injury II** Cisterns are present with midline shift of 0–5 mm and/or lesions densities present; no high or mixed density lesion >25 cm3. may include bone fragments and foreign bodies  
+**Diffuse injury III (swelling)** Cisterns compressed or absent with midline shift of 0–5mm; no high or mixed density lesion > 25 cc  
+**Diffuse injury IV (shift)** Midline shift >5 mm; no high or mixed density lesion >25 cm3  
+**Evacuated mass lesion** Any lesion surgically evacuated  
+**Non-evacuated mass lesion** High or mixed density lesion >25 cc; not surgically evacuated  
+Our cohort had no participants with Diffuse injury I (CT positive for intracranial pathology was an inclusion criteria).  
+
+```{r}
+#-------------------- Marshall's Ct score ---------------------------
+
+CT_cols =c('intracerebral_hematoma', 'contusion', 'duret_hemorrhage', 'hydrocephalus', 'hyogroma_chronic_sdh', 'shear','edh','sdh','sah','ivh','edema', 'rot2_midline_shift','downward_herniation') 
+
+
+rotter_df$clin_mass_25cc[is.na(rotter_df$clin_mass_25cc)] = 0
+rotter_df$marshall_score[rotter_df$rot2_midline_shift==1 & rotter_df$clin_mass_25cc!=1] = "Diffuse injury IV (shift)"
+rotter_df$marshall_score[rotter_df$rot1_basal_cisterns>=1 & rotter_df$rot2_midline_shift==0 & rotter_df$clin_mass_25cc!=1] = "Diffuse injury III (swelling)"
+rotter_df$marshall_score[rotter_df$rot1_basal_cisterns==0 & rotter_df$midline_shift<=5 & rotter_df$clin_mass_25cc!=1] = "Diffuse injury II"
+rotter_df$marshall_score[rowSums(rotter_df[CT_cols], na.rm=T)==0] = "Diffuse injury I"
+rotter_df$marshall_score[rotter_df$hematoma_status=="Evacuated hematoma"] = "Evacuated mass lesion"
+rotter_df$marshall_score[rotter_df$clin_mass_25cc==1 & rotter_df$hematoma_status=="Non-evacuated hematoma"] = "Non-evacuated mass lesion"
+
+```
+
+
+## Mortality rate by Marshall's score
+```{r}
+kable(table(rotter_df$marshall_score, rotter_df$outcome), align="l")
+```
+
+
+## Predicted vs. actual 6-month mortality
+Similar to the classification used in the IMPACT score chart, Marshall diffuse injuries I-II were given a score of 0 and other categories (swelling, midline shift, evacuated and non-evacuated mass) were given a score of 1.  
+
+```{r}
+rotter_df$Positive_marshall = ifelse(rotter_df$marshall_score %in% c("Diffuse injury I", "Diffuse injury II"), 0, 1)
+#confusionMatrix(as.factor(rotter_df$Positive_marshall), as.factor(rotter_df$ExpiredBy_6mo), positive = "1")
+
+kable(table(rotter_df$Positive_marshall, rotter_df$outcome), align="l",
+      caption="Prognosis by Marshall's score vs. Actual outcome") %>% 
+  add_footnote("Balanced accuracy: 81%, Sensitivity: 67%, Specificity: 95%")
+
+```
+
+Balanced accuracy: 81%, Sensitivity: 67%, Specificity: 95%
+
+## Discrimination
+
+```{r}
+model1 = glm(ExpiredBy_6mo ~ Positive_marshall, data=rotter_df, family=binomial)
+rotter_df$predictions = predict(model1, type='response')
+
+#ROC curve
+roc_marshall <- roc(rotter_df$ExpiredBy_6mo, rotter_df$predictions, ci=TRUE)
+plot(roc_marshall, print.thres = "best",print.auc=T, main="ROC curve for Marshall model")
+```
+
+
+AUC = 0.81, 95% CI: 0.67-0.96 (DeLong).   
+Sensitivity: 57%  
+Specificity: 95%.  
+
+
+# Rotterdam score (Maas et al., 2005)
+Similarly to Marshall's score, Rotterdam score was developed based on CT findings. It included midline shift and basal cisterns effacement, but did not include mass lesions > 25 cc or mass evacuation. In addition, it included the presence of EDH, SAH and IVH.  
+
+### Distribution of Rotterdam score by outcome
+
+```{r fig.height=2}
+rotter_df$survived = factor(rotter_df$ExpiredBy_6mo, levels=c(0,1), labels=c("Survived (n=77)", "Expired by 6 months (n=14)"))
+ggplot(data=rotter_df, aes(x=RotterdamScore)) + geom_histogram() +
+  facet_grid(.~survived) +xlab("Rotterdam score")
+```
+
+In this cohort all survivors had a Rotterdam score lower than 4.    
+A score of 3 was associated with 16% mortality (Mass 2005) but in our cohort 5.5% of those who had a Rotterdam score of 3 died.  
+
+
+### Mortality rate by Rotterdam score
+```{r}
+#mortality rate by score, in Rotterdam paper and TRACK-GERI cohorts
+geri_tab = data.frame(Rotterdam_score = 1:6, 
+                      N_rot = c(36, 600, 773, 465, 261, 114),
+                      mortality_rot = c("0 (0%)","41 (7%)", "122 (16%)", "121 (26%)", "138 (53%)", "69 (61%)"),
+                      N_geri = c(0, 32,60,4,1,2),
+                      mortality_geri=c("0 (0%)", "2 (7%)", "3 (5.5%)", "4 (100%)", "1 (100%)", "2 (100%)"))
+
+kable(geri_tab, col.names = c("Rotterdam score", "N participants", "Mortality n(%)", "N participants", "Mortality n(%)"),
+      align="l") %>%
+  add_header_above(c(" " = 1, "<65 years (Rotterdam)" = 2, "65+ years (TRACK-Geri)" = 2))
+
+
+
+```
+
+Higher scores were more rare in our cohort but seem highly indicative of poor outcome- only 8% had a score greater than 3, and they all died. Survival rates of older adults with a Rotterdam score of 4 or more should be investigated in a larger cohort with an adequate number of moderate-severe injuries.   
+
+## Predicted vs. actual 6-month mortality
+### Confusion matrix for Rotterdam score cut-off >3
+A Rotterdam score greater than 3 is associated with a worse prognosis. In a cohort younger than 65 years old there was 26%-61% mortality at 6 months (Maas 2005).   
+In our cohort this cut off had a sensitivity of 50% which is low.  
+Specificity was 100% and the balanced accuracy was 75%.
+
+```{r}
+#rotter_df$pos_rot = ifelse(rotter_df$RotterdamScore <=3, 0, 1)
+#confusionMatrix(as.factor(rotter_df$pos_rot), as.factor(rotter_df$ExpiredBy_6mo), positive = "1")
+
+kable(table(rotter_df$Positive_Rotterdam, rotter_df$outcome), align="l",
+      caption="Prognosis by Rotterdam score >3 vs. Actual outcome") %>% 
+  add_footnote("Balanced accuracy: 79%, Sensitivity: 58%, Specificity: 100%")
+
+```
+
+### Confusion matrix for Rotterdam score cut-off >2
+A lower threshold yields better sensitivity but poorer overall performance:   
+Sensitivity 83%, specificity: 33%, balanced accuracy = 58%.  
+Overall accuracy was 40%.
+
+```{r}
+rotter_df$pos_rot3 = ifelse(rotter_df$RotterdamScore <=2, 0, 1)
+#confusionMatrix(as.factor(rotter_df$pos_rot3), as.factor(rotter_df$ExpiredBy_6mo), positive = "1")
+
+rotter_df$rotter_3plus = factor(rotter_df$Rotterdam_3plus, levels=c(0,1), labels=c("<=2", ">2"))
+kable(table(rotter_df$rotter_3plus, rotter_df$outcome), align="l") %>%
+  add_footnote("Balanced accuracy: 58%, Sensitivity: 83%, Specificity: 33%")
+
+```
+
+
+## Discrimination
+
+```{r}
+model1 = glm(ExpiredBy_6mo ~ RotterdamScore, data=rotter_df, family=binomial)
+rotter_df$predictions = predict(model1, type='response')
+
+#ROC curve
+roc_rotterdam <- roc(rotter_df$ExpiredBy_6mo, rotter_df$predictions, ci=TRUE)
+plot(roc_rotterdam, print.thres = "best",print.auc=T, main="ROC curve for Rotterdam model")
+
+```
+AUC= 0.78 (95% CI: 0.60-0.96)  
+Sensitivity= 58%
+Specificity= 100%
+
+
+# IMPACT Model (Steyerberg et al, 2008)
+The IMPACT database includes data from 11 studies, with a total of 8,509 participants with severe-moderate TBI, aged 14+ (median age= 32, IQR=21-45).  
+3 models were suggested:     
+1. Core model- age, GCS motor score and pupil reaction to light.  
+2. Extended model- Core model + CT findings (Marshall score, tSAH, EDH) + hypoxia + hypotension at arrival to ED.  
+3. Lab model - extended model + blood glucose + blood hemoglobin in ED.
+
+IMPACT models were implemented according to the published coefficients and also by a score chart.    
+
+```{r}
+
+#--------------------------- IMPACT Core Model
+#creating variables according to IMPACT score's coefficients
+Intercept = -3.109
+rotter_df$impact_age = rotter_df$Age*0.034
+
+rotter_df$impact_gcs_motor = recode(rotter_df$GcsEDArrMotor,
+                                    "1-No Response" = 1.447,
+                                    "2-Extension" = 1.397,
+                                    "3-Flexion Abnormal" = 0.797,
+                                    "4-Flexion Withdrawal" = 0.39,
+                                    "5-Localizes to Pain" = 0,
+                                    "6-Obeys Commands" = 0,
+                                    "P-Untestable (Paralyzed)" = 0.522) %>% as.numeric()
+rotter_df$impact_gcs_motor[is.na(rotter_df$GcsEDArrMotor)] = 0.522 #coefficient for untestable or missing
+
+rotter_df$impact_pupil_reactivity = recode(rotter_df$EDPupilReactivity,
+                                           "Bilateral" = 0,
+                                           "Unilateral" = 0.514,
+                                           "None" = 1.239)
+rotter_df$ImpactCoreModel = Intercept +
+  rowSums(rotter_df[c("impact_age", "impact_gcs_motor", "impact_pupil_reactivity")], na.rm=T)
+
+#------------------------------------ IMPACT Extended (Core+CT, hypoxia and hypotension)
+Intercept = -3.787
+rotter_df$impact_age = rotter_df$Age*0.032
+
+
+rotter_df$impact_gcs_motor = recode(rotter_df$GcsEDArrMotor,
+                                    "1-No Response" = 1.205,
+                                    "2-Extension" = 1.207,
+                                    "3-Flexion Abnormal" = 0.746,
+                                    "4-Flexion Withdrawal" = 0.313,
+                                    "5-Localizes to Pain" = 0,
+                                    "6-Obeys Commands" = 0,
+                                    "P-Untestable (Paralyzed)" = 0.425) %>% as.numeric()
+rotter_df$impact_gcs_motor[is.na(rotter_df$GcsEDArrMotor)] = 0.425 #coefficient for untestable or missing
+
+rotter_df$impact_pupil_reactivity = recode(rotter_df$EDPupilReactivity,
+                                           "Bilateral" = 0,
+                                           "Unilateral" = 0.334,
+                                           "None" = 0.970)
+
+rotter_df$impact_Marshall = recode(rotter_df$marshall_score,
+                                   "Diffuse injury II" = 0,
+                                   "Diffuse injury III (swelling)" = 0.774,
+                                   "Diffuse injury IV (shift)" = 0.774,
+                                   "Evacuated mass lesion" = 0.651,
+                                   "Non-evacuated mass lesion" = 0.651)
+
+
+rotter_df$impact_tSAH = ifelse(rotter_df$sah==1, 0.606, 0)
+rotter_df$impact_EDH = ifelse(rotter_df$edh==1, -0.379, 0)
+rotter_df$impact_hypoxia = ifelse(rotter_df$EDArrHypoxia==1, 0.237, 0)
+rotter_df$impact_hypotension = ifelse(rotter_df$EDArrHypotension==1, 0.667, 0)
+
+extended_cols = c("impact_age", "impact_gcs_motor", "impact_pupil_reactivity", "impact_Marshall","impact_tSAH", "impact_EDH","impact_hypoxia", "impact_hypotension")
+
+rotter_df$ImpactExtendedModel = Intercept + rowSums(rotter_df[extended_cols], na.rm=TRUE)
+
+#------------------------------------ IMPACT Lab (extended + glucose and Hb)
+Intercept = -3.184
+rotter_df$impact_age = rotter_df$Age*0.02
+
+rotter_df$impact_gcs_motor = recode(rotter_df$GcsEDArrMotor,
+                                    "1-No Response" = 0.965,
+                                    "2-Extension" = 1.109,
+                                    "3-Flexion Abnormal" = 0.778,
+                                    "4-Flexion Withdrawal" = 0.310,
+                                    "5-Localizes to Pain" = 0,
+                                    "6-Obeys Commands" = 0,
+                                    "P-Untestable (Paralyzed)" = 0.462) %>% as.numeric()
+rotter_df$impact_gcs_motor[is.na(rotter_df$GcsEDArrMotor)] = 0.462 #coefficient for untestable or missing
+
+rotter_df$impact_pupil_reactivity = recode(rotter_df$EDPupilReactivity,
+                                           "Bilateral" = 0,
+                                           "Unilateral" = 0.09,
+                                           "None" = 0.533)
+rotter_df$impact_pupil_reactivity[is.na(rotter_df$EDPupilReactivity)] = 0.09 #missing data
+  
+rotter_df$impact_Marshall = recode(rotter_df$marshall_score,
+                                   "Diffuse injury II" = 0,
+                                   "Diffuse injury III (swelling)" = 0.715,
+                                   "Diffuse injury IV (shift)" = 0.715,
+                                   "Evacuated mass lesion" = 0.807,
+                                   "Non-evacuated mass lesion" = 0.807)
+
+
+
+rotter_df$impact_tSAH = ifelse(rotter_df$sah==1, 0.74, 0)
+rotter_df$impact_EDH = ifelse(rotter_df$edh==1, -0.51, 0)
+rotter_df$impact_hypoxia = ifelse(rotter_df$EDArrHypoxia==1, 0.36, 0)
+rotter_df$impact_hypotension = ifelse(rotter_df$EDArrHypotension==1, 0.366, 0)
+rotter_df$impact_glucose = 0.097*0.0555*rotter_df$EDGlucose #converting from mg/dL to mmol/L
+rotter_df$impact_Hb = -0.086*rotter_df$EDHemoglobin
+
+lab_cols = c("impact_age", "impact_gcs_motor", "impact_pupil_reactivity", "impact_Marshall","impact_tSAH", "impact_EDH","impact_hypoxia", "impact_hypotension", "impact_glucose", "impact_Hb")
+rotter_df$ImpactLabModel= Intercept + rowSums(rotter_df[lab_cols], na.rm=TRUE) #+ -3.787 intercept?
+
+```
+
+## Logistic regression
+The correlation of IMPACT models to the 6-month mortality outcome in the Geri cohort was tested using logistic regression models.
+
+```{r}
+#testing the IMPACT score
+model0 = glm(ExpiredBy_6mo ~ ImpactCoreModel, data=rotter_df, family=binomial)
+model2 = glm(ExpiredBy_6mo ~ ImpactExtendedModel, data=rotter_df, family=binomial)
+model3 = glm(ExpiredBy_6mo ~ ImpactLabModel, data=rotter_df, family=binomial)
+tab_model(model0, model2, model3, dv.labels=c("", "6-month mortality", ""))
+```
+
+IMPACT core model is not statistically significant (p-value=0.415). 
+IMPACT extended and lab models are statistically significant predictor of 6-month mortality in our cohort of older adults (p-value=0.03 and 0.001), with the lab model having the highest odds ratio (OR=9.86, 95% CI:3.02-47.55)) and pseudo-R-squared.  
+
+
+## Discrimination
+IMPACT models' performance was evaluated and compared using ROC curves.
+
+```{r}
+model_lab = glm(ExpiredBy_6mo ~ ImpactLabModel, data=rotter_df, family=binomial)
+model_ext = glm(ExpiredBy_6mo ~ ImpactExtendedModel, data=rotter_df, family=binomial)
+model_core = glm(ExpiredBy_6mo ~ ImpactCoreModel, data=rotter_df, family=binomial)
+
+rotter_df$predictions_lab = predict(model_lab, type='response')
+rotter_df$predictions_ext = predict(model_ext, type='response')
+rotter_df$predictions_core = predict(model_core, type='response')
+
+#creating ROC objects
+roc_lab <- roc(rotter_df$ExpiredBy_6mo, rotter_df$predictions_lab, ci=TRUE)
+roc_ext <- roc(rotter_df$ExpiredBy_6mo, rotter_df$predictions_ext, ci=TRUE) 
+roc_core <- roc(rotter_df$ExpiredBy_6mo, rotter_df$predictions_core, ci=TRUE)
+
+
+
+plot(roc_lab, main="IMPACT models")
+plot(roc_ext, add=TRUE, lty="dashed")
+plot(roc_core, add=TRUE, lty="dotted")
+
+legend("bottomright", legend = c("Lab model: AUC = 0.81 (CI: 0.65-0.97)", 
+                                 "Extended model: AUC = 0.76 (CI: 0.60-0.91)", 
+                                 "Core model: AUC = 0.45 (CI: 0.28-0.71)"), 
+       lty = c("solid", "dashed","dotted"), 
+       cex=1, lwd=1.5, inset = 0.05) 
+
+```
+
+```{r}
+
+#comparing AUC
+# roc.test(roc_core, roc_ext)#p-value= 0.078
+# roc.test(roc_core, roc_lab)#p-value=0.023
+# roc.test(roc_lab, roc_ext)#p-value=0.230
+# 
+# roc.test(roc_lab, roc_marshall) #p-value=0.977
+# roc.test(roc_lab, roc_rotterdam) #p-value=0.549
+# roc.test(roc_rotterdam, roc_marshall) #p-value=0.581
+
+#roc.test(roc_core, roc_marshall) #p-value=0.977
+#roc.test(roc_core, roc_rotterdam) #p-value=0.549
+# roc.test(roc_rotterdam, roc_marshall) #p-value=0.581
+```
+
+
+Best AUC was obtained by the IMPACT Lab model (AUC=0.81, 95% CI: 0.65-0.97).  
+Sensitivity= 0.75, Specificity= 0.87.  
+IMPACT extended achieved an AUC of 0.76 (95% CI: 0.60-0.91).  As expected, IMPACT core's AUC was 0.45 (95% CI: 0.28-0.71), worse than a coin flip.
+To test for differences between IMPACT models' performance, pairwise comparisons of AUCs of the 3 models were performed using DeLong's test for two correlated ROC curves. IMPACT lab model had a statistically significant difference from the IMPACT core model (p-value=0.023), but no statistically significant difference was found between the extended model and the core model (p-value=0.23) or the lab model (p-value=0.078). It should be remembered that due to the small sample size the confidence intervals for the AUCs are very wide and the ability to detect statistically significant differences is very limited.  
+
+## Summary  
+Marshall's score had an AUC of 0.81 (95% CI: 0.67-0.96), Rotterdam score had an AUC of 0.78 (95% CI: 0.60-0.96) and IMPACT lab model had an AUC of 0.81 (CI: 0.65-0.97).  
+No statistically significant differences were found between models' AUCs, except for IMPACT core model which was significantly worse than IMPAT lab and had no statistically significant correlation to 6-month mortality (p-value=0.415). Marshall's classification and Rotterdam's score have an accepted cut-off, which has a sensitivity of 67% and 58% respectively, which is low. 
+
+
+# 6-month mortality predictors
+
+
+
+
+## CT findings
+
+```{r}
+
+conf_int_generic <-function(x, ...) { #for categorical variables
+  y <- unlist(x)
+  g <- factor(rep(1:length(x), times=sapply(x, length)))
+  
+  m = glm(g~y, family=binomial)
+  
+  or_ci = 1/exp(cbind("Odds ratio" = coef(m), confint.default(m, level = 0.95)))
+  or_ci = round(or_ci, digits=1)[2,]
+  
+  #formatting a string with the OR and CI in parentheses
+  paste0(or_ci[1], " (", or_ci[3], " - ", or_ci[2], ")")
+}
+
+
+
+ct_cols = c("rot1_basal_cisterns", "rot2_midline_shift", "shear", "edema", "contusion",
+"edh", "sah", "sdh", "ivh", "skull_fx", "clin_mass_25cc")
+df[ct_cols] = apply(df[ct_cols], MARGIN=2, FUN=as.logical)
+
+
+
+Hmisc::label(df$hematoma_status)= "Hematoma evacuation"
+Hmisc::label(df$clin_mass_25cc) = "Lesion size > 25cc"            
+Hmisc::label(df$rot1_basal_cisterns) = "Basal cisterns effacement (partial or full)"
+Hmisc::label(df$rot2_midline_shift) = "Midline shift > 5mm"
+Hmisc::label(df$shear) = "Shear"
+Hmisc::label(df$edema) = "Edema"
+Hmisc::label(df$contusion) = "Contusion"
+Hmisc::label(df$edh) = "Epidural hematoma"
+Hmisc::label(df$sah) = "Subarachnoid hematoma"
+Hmisc::label(df$sdh) = "Subdural hematoma"
+Hmisc::label(df$ivh) = "Intraventricular hematoma"
+Hmisc::label(df$skull_fx) = "Skull fracture"
+
+df$evacuated = ifelse(df$hematoma_status=="Evacuated hematoma", T, F)
+Hmisc::label(df$evacuated) = "Evacuated hematoma"
+
+table1(~clin_mass_25cc + evacuated+ rot1_basal_cisterns +rot2_midline_shift + shear + 
+         edema + contusion+ skull_fx +
+        sdh + edh + sah+ ivh 
+         | outcome,
+         data = df,
+        overall=FALSE, extra.col=list(`P-value`=pvalue, `OR (95% CI)` = conf_int_generic),
+         render=render_logical,
+         render.continuous = render_cont)
+
+```
+
+Basal cisterns effacement, midline shift, shear, edema, contusion and skull fracture were significantly correlated to 6-month mortality. Hemorrhagic findings that are used in most prediction models- EDH, SAH, and IVH did not show a statistically significant correlation. SDH was nearly significant.  
+
+
+
+## Clinical and lab characteristics
+```{r}
+df$gluc20 = df$EDGlucose/20
+
+table1(~ Age + GcsEDArrMotor + EDPupilReactivity + EDArrHypotension+ 
+                 EDGlucose + EDHemoglobin  | outcome,
+         data = df,
+         overall=FALSE, extra.col=list(`P-value`=pvalue, `OR (95% CI)` = conf_int_generic),
+         render=render_logical,
+         render.continuous = render_cont)#%>% ka
+```
+
+## Predictors' odds ratio plot
+
+```{r}
+# creating a forest plot to visualize ORs and CIs
+#scaling ED glucose by 1/10
+df$gluc10 = df$EDGlucose/10
+df$evacuated = ifelse(df$hematoma_status=="Evacuated hematoma", T, F)
+
+conf_int_table <-function(x) {
+  y <- df$outcome
+    m = glm(y~x, family=binomial)
+  
+  or_ci = 1/exp(cbind("Odds ratio" = coef(m), confint.default(m, level = 0.95)))
+  or_ci = or_ci[2,]
+  return(or_ci)
+}
+
+var_list = c("evacuated", "rot1_basal_cisterns", "rot2_midline_shift", "shear", "edema",
+             "contusion", "skull_fx", "sdh", "edh", "sah", "ivh", "Age", "GcsEDArrMotor", 
+             "gluc10", "EDHemoglobin")
+
+# var_labels = c("Evacuated hematoma", "Basal cisterns effacement", "Midline shift > 5mm", "Shear", "Edema", "Contusion", "Skull fracture", "Subdural hematoma", "Epidural hematoma", "Subarachnoid hematoma", "Intraventricular hematoma", "Age", "GCS motor", "ED Glucose (scaled by 1/10)", "ED Hemoglobin")
+
+var_labels = c("Evacuated hematoma (n=4)", "Basal cisterns effacement (n=8)", "Midline shift (n=9)", "Shear (n=17)", "Edema (n=6)", "Contusion (n=26)", "Skull fracture (n=19)", "SDH (n=57)", "EDH (n=5)", "SAH (n=59)", "IVH (n=13)", "Age", "GCS motor", "ED Glucose (scaled by 1/10)", "ED Hemoglobin")
+
+ci_df = apply(df[var_list], 2, conf_int_table) %>% t() %>% data.frame()
+colnames(ci_df) = c("OR", "upper", "lower")
+#age
+ci_df$OR[12] = 1
+ci_df$upper[12] = 1
+ci_df$lower[12] = 0.9
+
+#gluc10
+ci_df$OR[14] = 1.14
+ci_df$upper[14] = 1.01
+ci_df$lower[14] = 1.31
+
+#hemoglobin
+ci_df$OR[15] = 0.9
+ci_df$upper[15] = 0.6
+ci_df$lower[15] = 1.3
+
+base_data <- tibble::tibble(mean = round(ci_df$OR, digits=1), 
+                            lower = ci_df$lower, 
+                            upper = ci_df$upper,
+                            preds = var_labels, 
+                            OR = as.character(round(ci_df$OR, digits=1)))
+
+base_data |>
+  forestplot(labeltext = c(preds, OR), #columns
+             boxsize = 0.2,
+             vertices = TRUE,
+             xlog = TRUE, #x-axis is logarithmic (suitable for logistic regression, survival analysis)
+             txt_gp = fpTxtGp(cex=1.5))|>
+  fp_set_style(box = "black",
+               line = "black",
+               align = "lc")|> 
+  fp_add_header(preds = c("Predictors"),
+                OR = c("Odds Ratio"))  |>
+  fp_decorate_graph(graph.pos = 2) |>
+  fp_set_zebra_style("#EFEFEF")
+
+
+```
+
+# Other predictors
+To explore possible correlates of mortality, sample's characteristics were described by 6-month mortality outcome.
+
+## Demographic and pre-injury clinical characteristics
+
+```{r}
+
+table1(~ Age + Sex + Race + EduYrCt + EmplmtStatus + MaritalStatus + Subject_LivingSituation +
+         RegularActivities + HealthInsurance + AUDITC_score + 
+         Smoked100Cigs + TotalYrsSmoked + CurrUseTobacco + preinjury_cognitive_status + 
+         FAQ_score_Baseline + WalkingBlocks_Baseline + GFI_score_Baseline + frailty + 
+         NPIQ_score_Baseline + eCogMean_score_Baseline | outcome,
+         data = df,
+         overall=FALSE, extra.col=list(`P-value`=pvalue),
+         render=render_logical,
+         render.continuous = render_cont
+       )
+```
+
+Years of education was higher in those expired (17 years vs. 15 years, p-value=0.022).  
+No statistically significant difference was found in pre-injury cognitive status (p-value=0.55). those who expired appear to be a bit more frail, with a higher GFI and FAQ, although the difference is not statistically significant. However, they scored better on NPI-Q and ECOg12, and these differences were also not statistically significant.  
+
+## Medical history
+
+```{r}
+binary_cols = c("CardioCAD", "CardioAtrlFibr", "CardioValvularDisease", "CardioCongHeartFailure", "CardioPacemaker", "CardioOther", "CerebroVascularDisease",
+                "ParkinsonsDisease", "AlzheimersDisease", "Headache", "Diabetes", "Hpertension", "Hyprchlstrmia", "B12Def", "ThyroidDisease", "IncntnceUrinary",
+                "SleepApnea", "REMSleepBhvrDisodr", "ChronicKidneyDis", "ChronicLungDisease", "Arthritis", "OutPtHelpPsych", "HospitalPsych", "MedsPsych", "PsychiatricAnx",
+                "PsychiatricDep", "PsychiatricOther", "DevelopmentalCondition", "Anticoagulants", "PlateletAggregInhibitors",
+                "ADdementiaPD_early_onset")
+
+df[binary_cols] = apply(df[binary_cols], MARGIN=2, FUN=as.logical)
+#formatting categorical variables
+#1=Parent, 2=Sibling, 3=Child
+df$ADdementiaPD_relative = factor(df$ADdementiaPD_relative)
+#1=Alzheimer's disease, 2=other dementia, 3=Parkinson's disease
+df$ADdementiaPD_type = factor(df$ADdementiaPD_type)
+
+#labeling
+Hmisc::label(df$comorbidities_n) = "Number of pre-existing medical conditions"
+Hmisc::label(df$Charlson_comorbidity_index) = "Charlson Comorbidity Index (range 2-37 (worst))"
+Hmisc::label(df$polypharmacy_n) = "Number of pre-injury medications"
+Hmisc::label(df$CardioCAD) = "CAD"
+Hmisc::label(df$CardioAtrlFibr) = "Atrial fibrillation"
+Hmisc::label(df$CardioValvularDisease) = "Valvular disease"
+Hmisc::label(df$CardioCongHeartFailure) = "Congestive Heart Failure"
+Hmisc::label(df$CardioPacemaker) = "Pacemaker"
+Hmisc::label(df$CardioOther) = "Other cardiac condition"
+Hmisc::label(df$CerebroVascularDisease) = "Cerebrovascular Disease"
+Hmisc::label(df$ParkinsonsDisease) = "Parkinson's Disease"
+Hmisc::label(df$AlzheimersDisease) = "Alzheimer's Disease"
+Hmisc::label(df$Headache) = "Headache"
+Hmisc::label(df$Diabetes) = "Diabetes (type I and II)" 
+Hmisc::label(df$Hpertension) = "Hypertension"
+Hmisc::label(df$Hyprchlstrmia) = "Hypercholesterolemia"
+Hmisc::label(df$B12Def) = "B12 Deficiency"
+Hmisc::label(df$ThyroidDisease) = "Thyroid disease"
+Hmisc::label(df$IncntnceUrinary) = "Urinary incontinence"
+Hmisc::label(df$SleepApnea) = "Sleep apnea"
+Hmisc::label(df$REMSleepBhvrDisodr) = "REM Sleep Behavior Disorder"
+Hmisc::label(df$ChronicKidneyDis) = "Chronic Kidney Disease"
+Hmisc::label(df$ChronicLungDisease) = "Chronic Lung Disease"
+Hmisc::label(df$Arthritis) = "Arthritis"
+Hmisc::label(df$OutPtHelpPsych) = "Psychiatric clinic consultation"
+Hmisc::label(df$HospitalPsych) = "Psychiatric hospital"
+Hmisc::label(df$MedsPsych) = "Psychiatric medication"
+Hmisc::label(df$PsychiatricAnx) = "Anxiety"
+Hmisc::label(df$PsychiatricDep) = "Depression"
+Hmisc::label(df$PsychiatricOther) = "Other psychiatric disorder"
+Hmisc::label(df$DevelopmentalCondition) = "Developmental condition"
+Hmisc::label(df$PlateletAggregInhibitors) = "Platelet aggregation inhibitors"
+Hmisc::label(df$ADdementiaPD_relative) = "Relative with AD, dementia or PD"
+Hmisc::label(df$ADdementiaPD_type) = "AD, dementia or PD of relative"
+Hmisc::label(df$ADdementiaPD_early_onset) = "AD, dementia or PD early onset in relative"
+
+table1(~ comorbidities_n + Charlson_comorbidity_index + polypharmacy_n + 
+         CardioCAD + CardioAtrlFibr + CardioValvularDisease + CardioCongHeartFailure + CardioPacemaker + 
+         CardioOther + CerebroVascularDisease + ParkinsonsDisease + AlzheimersDisease + Headache + Diabetes + 
+         Hpertension + Hyprchlstrmia + B12Def + ThyroidDisease + IncntnceUrinary + SleepApnea + 
+         REMSleepBhvrDisodr + ChronicKidneyDis + ChronicLungDisease + Arthritis + OutPtHelpPsych + HospitalPsych + 
+                        MedsPsych + PsychiatricAnx + PsychiatricDep + PsychiatricOther + DevelopmentalCondition + 
+                        Anticoagulants + PlateletAggregInhibitors +
+                         ADdementiaPD_type + ADdementiaPD_relative + ADdementiaPD_early_onset | outcome, 
+                     data=df,
+                     overall=FALSE, extra.col=list(`P-value`=pvalue),
+                     render=render_logical)
+```
+
+
+Medical conditions and comorbidity in general were the same for those who expired and those who survived.  
+
+## Injury and clinical characteristics
+```{r}
+
+  
+table1(~ presenting_GCS + GCS_severity + GcsEDArrMotor + EDPupilReactivity + 
+         LOC + PTA + ACRM + ACRMneg_CTpos + ACRMpos_CTneg +
+         prior_TBI_PTA_LOC + prior_TBI_freq +
+         EDCorrCoagulopathy + injury_mechanism + external_injury + 
+         EDGlucose + EDHemoglobin + EDArrHypotension + EDArrHypoxia
+         | outcome,
+         data = df,
+        overall=FALSE, extra.col=list(`P-value`=pvalue),
+         render=render_logical,
+         render.continuous = render_cont)
+```
+
+As expected, those who expired had a higher proportion of severe TBI (21% vs. 1%, p-value=0.014).   
+**Motor GCS and pupil reactivity** (which are used in the IMPACT model) were not significantly correlated to 6-month mortality.      
+Participants who expired had a higher proportion of **anticoagulant reversal in ED** (43% vs. 9%, p-value=0.004), although the proportion of pre-injury anticoagulant and anti-platelet use was the same for those who expired and those who survived.     
+Their **glucose levels on arrival to the ED** were higher (Mean 160 mg/dL vs. 130 mg/dL, p-value=0.036). Hyperglycemia occurs frequently after TBI and was associated with poor outcomes and mortality (citation: "Review: Traumatic brain injury and hyperglycemia, a potentially modifiable risk factor").   
+
+
+```{r}
+#plotting ED glucose by outcome
+ggplot(data=df, aes(x=EDGlucose, color=outcome)) + geom_density() + xlab("ED Glucose (mg/dL)")
+
+
+```
